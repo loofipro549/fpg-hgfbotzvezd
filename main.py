@@ -35,7 +35,7 @@ API_TOKEN = os.getenv("TG_TOKEN", "7984506224:AAEd3y8AgaP-DjjFqVZ8RfW4Q71yOxgK65
 BOT_USERNAME = os.getenv("BOT_USERNAME", "LofiProMailer_Bot")
 OWNER_ID = int(os.getenv("OWNER_ID", "595041765"))
 
-OPEN_CHANNEL = os.getenv("OPEN_CHANNEL", "@gmaillofipro")
+OPEN_CHANNEL = os.getenv("OPEN_CHANNEL", "gmaillofipro")
 PRIVATE_CHANNEL_FAKE_NAME = "Канал 2"
 
 DAILY_FREE_KEYS = 2
