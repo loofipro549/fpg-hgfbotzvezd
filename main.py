@@ -3,7 +3,7 @@
 LofiProMailer_Bot — полностью рабочий Telegram-бот на aiogram 2.25
 Функции:
 - /start с реферальной системой
-- Проверка подписки на открытый и закрытый канал
+- Проверка подписки на открытый канал
 - FSM для отправки писем с фото
 - SMTP через список аккаунтов
 - SQLite база для пользователей, логов писем и SMTP
@@ -258,7 +258,6 @@ def sub_check_kb() -> types.InlineKeyboardMarkup:
         types.InlineKeyboardButton(f"{PRIVATE_CHANNEL_FAKE_NAME}", url="https://t.me/+tF_oI1s4EGFhOWUy")
     )
     kb.add(
-        types.InlineKeyboardButton("✅ Я подписался", callback_data="confirm_private"),
         types.InlineKeyboardButton("🔁 Проверить", callback_data="recheck")
     )
     return kb
@@ -296,25 +295,15 @@ async def cmd_start(message: types.Message):
 async def is_subscribed_open_channel(user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(OPEN_CHANNEL.replace("@",""), user_id)
-        # считаем подписанным, если он не вышел и не кикнут
         return member.status not in ("left", "kicked")
     except Exception as e:
         logger.warning(f"Ошибка проверки подписки для {user_id}: {e}")
         return False
 
-@dp.callback_query_handler(lambda c: c.data == "confirm_private")
-async def confirm_private(call: types.CallbackQuery):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET private_confirmed=1 WHERE user_id=?", (call.from_user.id,))
-        await db.commit()
-    await call.answer("Подписка зафиксирована ✅", show_alert=True)
-
 @dp.callback_query_handler(lambda c: c.data == "recheck")
 async def recheck_subscription(call: types.CallbackQuery):
-    user = await get_or_create_user(call.from_user.id)
     subscribed_open = await is_subscribed_open_channel(call.from_user.id)
-    private_ok = user.get("private_confirmed") == 1
-    if subscribed_open and private_ok:
+    if subscribed_open:
         await call.answer("Доступ открыт!", show_alert=False)
         await send_with_photo(
             bot,
@@ -323,7 +312,7 @@ async def recheck_subscription(call: types.CallbackQuery):
             reply_markup=menu_kb()
         )
     else:
-        await call.answer("Подписка не подтверждена", show_alert=True)
+        await call.answer("Подписка на открытый канал не подтверждена", show_alert=True)
 
 # ===================== MAIN =====================
 async def on_startup(dp: Dispatcher):
