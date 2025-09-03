@@ -123,6 +123,42 @@ async def init_db():
         await db.execute(CREATE_MAIL_LOG_SQL)
         await db.execute(CREATE_USED_SMTP_SQL)
         await db.commit()
+        
+# ===================== ПРОВЕРКА ПОДПИСКИ =====================
+async def is_subscribed_open_channel(user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(OPEN_CHANNEL.replace("@",""), user_id)
+        return member.status in ("creator", "administrator", "member", "restricted")
+    except Exception as e:
+        logger.warning(f"Проверка подписки упала для {user_id}: {e}")
+        return False
+
+@dp.callback_query_handler(lambda c: c.data == "confirm_private")
+async def confirm_private(call: types.CallbackQuery):
+    user = await get_or_create_user(call.from_user.id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET private_confirmed=1 WHERE user_id=?", (call.from_user.id,))
+        await db.commit()
+    await call.answer("Подписка зафиксирована ✅", show_alert=True)
+
+@dp.callback_query_handler(lambda c: c.data == "recheck")
+async def recheck_subscription(call: types.CallbackQuery):
+    user = await get_or_create_user(call.from_user.id)
+    subscribed_open = await is_subscribed_open_channel(call.from_user.id)
+    private_ok = user.get("private_confirmed") == 1
+    logger.info(f"user {call.from_user.id}: subscribed_open={subscribed_open}, private_confirmed={private_ok}")
+
+    if subscribed_open and private_ok:
+        await call.answer("Доступ открыт!", show_alert=False)
+        await send_with_photo(
+            bot,
+            call.message.chat.id,
+            "<b>Главное меню</b>\n\nВыберите действие ниже.",
+            reply_markup=menu_kb()
+        )
+    else:
+        await call.answer("Подписка не подтверждена", show_alert=True)
+
 
 async def get_or_create_user(user_id: int) -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
