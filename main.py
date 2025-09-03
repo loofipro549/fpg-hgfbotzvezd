@@ -3,14 +3,15 @@ import asyncio
 import logging
 import os
 import random
+import re
+import aiosqlite
 from datetime import date
 from typing import List, Optional, Tuple
 
-import aiosqlite
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.utils import executor
 
 import smtplib
@@ -19,25 +20,16 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 
-from telethon import TelegramClient
-from telethon.tl.functions.channels import GetParticipantRequest
-from telethon.errors import UserNotParticipantError
-
 # ===================== НАСТРОЙКИ =====================
 API_TOKEN = "7984506224:AAEd3y8AgaP-DjjFqVZ8RfW4Q71yOxgK65w"
 BOT_USERNAME = "LofiProMailer_Bot"
-OWNER_ID = 595041765
-
-API_ID = 24484081
-API_HASH = "d80e82b5cadb9ba9201fdfbeccd24326"
-
-OPEN_CHANNEL = "gmaillofipro"  # Публичный канал для проверки
-OPTIONAL_CHANNEL_NAME = "Канал 2"
-OPTIONAL_CHANNEL_LINK = "https://t.me/+tF_oI1s4EGFhOWUy"  # Необязательный
-
+OWNER_ID = 865648878
+OPEN_CHANNEL = "gmaillofipro"  # без @
+PRIVATE_CHANNEL_FAKE_NAME = "Канал 2"
 DAILY_FREE_KEYS = 2
 BONUS_NAME_TEXT = "@LofiProMailer_Bot"
 PHOTO_DIR = "photo"
+TMP_DIR = "tmp"
 
 
 SMTP_ACCOUNTS = {
@@ -67,42 +59,11 @@ SMTP_ACCOUNTS = {
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("LofiProMailer_Bot")
 DB_PATH = "LofiProMailer_Bot.db"
 
-# ===================== SQL =====================
-CREATE_USERS_SQL = """
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    keys_today INTEGER DEFAULT 0,
-    last_reset DATE,
-    referrer_id INTEGER,
-    referrals_count INTEGER DEFAULT 0,
-    bonus_name_last DATE
-);
-"""
-
-CREATE_MAIL_LOG_SQL = """
-CREATE TABLE IF NOT EXISTS mail_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    to_email TEXT,
-    subject TEXT,
-    body TEXT,
-    sent_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    smtp_used TEXT
-);
-"""
-
-CREATE_USED_SMTP_SQL = """
-CREATE TABLE IF NOT EXISTS used_smtp (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    smtp_login TEXT,
-    day TEXT
-);
-"""
+# ===================== ЛОГИ =====================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("LofiProMailer_Bot")
 
 # ===================== FSM =====================
 class SendMailStates(StatesGroup):
@@ -110,28 +71,44 @@ class SendMailStates(StatesGroup):
     asking_subject = State()
     asking_body = State()
     asking_photos = State()
+    collecting_photos = State()
     confirming = State()
 
-# ===================== TELETHON =====================
-telethon_client = TelegramClient('bot', API_ID, API_HASH)
+# ===================== ХЕЛПЕРЫ =====================
+EMAIL_REGEX = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 
-async def is_subscribed_open_channel(user_id: int) -> bool:
-    await telethon_client.start()
-    try:
-        await telethon_client(GetParticipantRequest(channel=OPEN_CHANNEL, participant=user_id))
-        return True
-    except UserNotParticipantError:
-        return False
-    except Exception as e:
-        logger.warning(f"Ошибка проверки подписки: {e}")
-        return False
-
-# ===================== БД =====================
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(CREATE_USERS_SQL)
-        await db.execute(CREATE_MAIL_LOG_SQL)
-        await db.execute(CREATE_USED_SMTP_SQL)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            keys_today INTEGER DEFAULT 0,
+            last_reset DATE,
+            subscribed INTEGER DEFAULT 0,
+            whitelisted INTEGER DEFAULT 0,
+            referrer_id INTEGER,
+            referrals_count INTEGER DEFAULT 0,
+            private_confirmed INTEGER DEFAULT 0,
+            bonus_name_last DATE
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS mail_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            to_email TEXT,
+            subject TEXT,
+            body TEXT,
+            sent_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            smtp_used TEXT,
+            day TEXT
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS used_smtp (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            smtp_login TEXT,
+            day TEXT
+        )""")
         await db.commit()
 
 async def get_or_create_user(user_id: int) -> dict:
@@ -140,10 +117,8 @@ async def get_or_create_user(user_id: int) -> dict:
         cur = await db.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
         row = await cur.fetchone()
         if row is None:
-            await db.execute(
-                "INSERT INTO users (user_id, keys_today, last_reset) VALUES (?, ?, ?)",
-                (user_id, 0, date.today().isoformat())
-            )
+            await db.execute("INSERT INTO users (user_id, keys_today, last_reset) VALUES (?, ?, ?)",
+                             (user_id, DAILY_FREE_KEYS, date.today().isoformat()))
             await db.commit()
             cur = await db.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
             row = await cur.fetchone()
@@ -153,10 +128,8 @@ async def reset_daily_if_needed(user: dict) -> dict:
     today = date.today().isoformat()
     if user["last_reset"] != today:
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE users SET keys_today=?, last_reset=? WHERE user_id=?",
-                (DAILY_FREE_KEYS, today, user["user_id"])
-            )
+            await db.execute("UPDATE users SET keys_today=?, last_reset=? WHERE user_id=?",
+                             (DAILY_FREE_KEYS, today, user["user_id"]))
             await db.execute("DELETE FROM used_smtp WHERE user_id=? AND day!=?", (user["user_id"], today))
             await db.commit()
         user["keys_today"] = DAILY_FREE_KEYS
@@ -165,94 +138,105 @@ async def reset_daily_if_needed(user: dict) -> dict:
 
 async def apply_name_bonus_if_needed(user: dict, full_name: str) -> dict:
     today = date.today().isoformat()
-    if user.get("bonus_name_last") == today:
-        return user
-    if full_name and BONUS_NAME_TEXT.replace("@","").lower() in full_name.replace("@","").lower():
+    if user.get("bonus_name_last") != today and full_name and BONUS_NAME_TEXT.replace("@","").lower() in full_name.replace("@","").lower():
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE users SET keys_today = keys_today + 1, bonus_name_last=? WHERE user_id=?",
-                (today, user["user_id"])
-            )
+            await db.execute("UPDATE users SET keys_today = keys_today + 1, bonus_name_last=? WHERE user_id=?",
+                             (today, user["user_id"]))
             await db.commit()
         user["keys_today"] += 1
         user["bonus_name_last"] = today
     return user
 
-async def save_referrer_if_first_time(user_id: int, referrer_id: Optional[int]):
-    if not referrer_id or referrer_id == user_id:
-        return
+async def pick_smtp_for_today(user_id: int) -> Tuple[str, str]:
+    all_logins = list(SMTP_ACCOUNTS.keys())
+    today = date.today().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT referrer_id FROM users WHERE user_id=?", (user_id,))
-        row = await cur.fetchone()
-        if row and row["referrer_id"] is None:
-            await db.execute("UPDATE users SET referrer_id=? WHERE user_id=?", (referrer_id, user_id))
-            await db.execute("UPDATE users SET referrals_count = referrals_count + 1, keys_today = keys_today + 1 WHERE user_id=?", (referrer_id,))
-            await db.commit()
+        cur = await db.execute("SELECT smtp_login FROM used_smtp WHERE user_id=? AND day=?", (user_id, today))
+        used = {r["smtp_login"] for r in await cur.fetchall()}
+    available = [x for x in all_logins if x not in used]
+    login = random.choice(available if available else all_logins)
+    pwd = SMTP_ACCOUNTS[login].replace(" ","")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO used_smtp (user_id, smtp_login, day) VALUES (?, ?, ?)", (user_id, login, today))
+        await db.commit()
+    return login, pwd
+
+async def send_email_via_smtp(from_login, from_pwd, to_email, subject, body, attachments: List[str]) -> Tuple[bool,str]:
+    msg = MIMEMultipart()
+    msg['From'] = from_login
+    msg['To'] = to_email
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'plain','utf-8'))
+    for path in attachments:
+        try:
+            with open(path,'rb') as f:
+                part = MIMEBase('application','octet-stream')
+                part.set_payload(f.read())
+            encoders.encode_base64(part)
+            part.add_header('Content-Disposition', f'attachment; filename="{os.path.basename(path)}"')
+            msg.attach(part)
+        except Exception as e:
+            logger.warning(f"Attachment error {path}: {e}")
+    try:
+        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
+        server.starttls()
+        server.login(from_login, from_pwd)
+        server.send_message(msg)
+        server.quit()
+        return True,"OK"
+    except Exception as e:
+        return False,str(e)
+
+async def send_with_photo(bot: Bot, chat_id: int, text: str, reply_markup=None):
+    os.makedirs(PHOTO_DIR, exist_ok=True)
+    try:
+        files = [f for f in os.listdir(PHOTO_DIR) if f.lower().endswith((".jpg",".jpeg",".png"))]
+        if files:
+            path = os.path.join(PHOTO_DIR, random.choice(files))
+            with open(path,'rb') as ph:
+                await bot.send_photo(chat_id, ph, caption=text, reply_markup=reply_markup, parse_mode="HTML")
+            return
+    except: pass
+    await bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode="HTML")
 
 # ===================== КЛАВИАТУРЫ =====================
-def menu_kb() -> types.InlineKeyboardMarkup:
+def menu_kb():
     kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("💳 Купить подписку", callback_data="buy"),
-        types.InlineKeyboardButton("👥 Реферальная система", callback_data="ref"),
-        types.InlineKeyboardButton("✉️ Отправить письмо", callback_data="send"),
-        types.InlineKeyboardButton("👤 Профиль", callback_data="profile")
-    )
+    kb.add(types.InlineKeyboardButton("💳 Купить подписку", callback_data="buy"),
+           types.InlineKeyboardButton("👥 Реферальная система", callback_data="ref"))
+    kb.add(types.InlineKeyboardButton("✉️ Отправить письмо", callback_data="send"),
+           types.InlineKeyboardButton("👤 Профиль", callback_data="profile"))
     return kb
 
-def sub_check_kb() -> types.InlineKeyboardMarkup:
+def sub_check_kb():
     kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("Канал 1", url=f"https://t.me/{OPEN_CHANNEL}"),
-        types.InlineKeyboardButton(f"{OPTIONAL_CHANNEL_NAME}", url=OPTIONAL_CHANNEL_LINK)
-    )
-    kb.add(
-        types.InlineKeyboardButton("✅ Я подписался", callback_data="recheck")
-    )
+    kb.add(types.InlineKeyboardButton("Канал 1", url=f"https://t.me/{OPEN_CHANNEL}"))
+    kb.add(types.InlineKeyboardButton(PRIVATE_CHANNEL_FAKE_NAME, url="https://t.me/+tF_oI1s4EGFhOWUy"))
+    kb.add(types.InlineKeyboardButton("✅ Я подписался", callback_data="confirm_private"),
+           types.InlineKeyboardButton("🔁 Проверить", callback_data="recheck"))
+    return kb
+
+def confirm_mail_kb():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(types.InlineKeyboardButton("✅ Да", callback_data="confirm_send"),
+           types.InlineKeyboardButton("❌ Нет", callback_data="cancel_send"))
     return kb
 
 # ===================== БОТ =====================
 bot = Bot(API_TOKEN)
 dp = Dispatcher(bot, storage=MemoryStorage())
 
+# /start
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
-    args = message.get_args().strip()
     user = await get_or_create_user(message.from_user.id)
     user = await reset_daily_if_needed(user)
-    full_name = " ".join(filter(None, [message.from_user.first_name, message.from_user.last_name or ""]))
+    full_name = " ".join(filter(None,[message.from_user.first_name,message.from_user.last_name or ""]))
     user = await apply_name_bonus_if_needed(user, full_name)
-    try:
-        referrer_id = int(args) if args else None
-    except:
-        referrer_id = None
-    await save_referrer_if_first_time(message.from_user.id, referrer_id)
-
-    await message.answer(
-        "<b>Добро пожаловать!</b>\n\nПодпишитесь на каналы ниже и нажмите ✅ Я подписался",
-        reply_markup=sub_check_kb()
-    )
-
-@dp.callback_query_handler(lambda c: c.data == "recheck")
-async def recheck_subscription(call: types.CallbackQuery):
-    subscribed = await is_subscribed_open_channel(call.from_user.id)
-    if subscribed:
-        await call.message.edit_text(
-            "<b>Главное меню</b>\nВыберите действие ниже.",
-            reply_markup=menu_kb()
-        )
-        await call.answer("Доступ открыт!", show_alert=False)
-    else:
-        await call.answer("Подписка на канал не подтверждена.", show_alert=True)
-
-# ===================== MAIN =====================
-async def on_startup(dp: Dispatcher):
-    await init_db()
-    logger.info("БД готова")
-    await telethon_client.start()
-    logger.info("Telethon готов")
-
-if __name__ == "__main__":
-    asyncio.get_event_loop().run_until_complete(init_db())
-    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+    await send_with_photo(bot, message.chat.id,
+                          "<b>Добро пожаловать!</b>\n\n"
+                          "<b>Канал 1</b> — подпишись.\n"
+                          f"<b>Канал 2</b> — подпишись.\n\n"
+                          "После подписки нажми <b>Проверить</b> для доступа.",
+                          reply_markup=sub_check_kb())
