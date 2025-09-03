@@ -292,9 +292,11 @@ async def cmd_start(message: types.Message):
     )
 
 # --------------------- Проверка подписки ---------------------
+# --------------------- Проверка подписки ---------------------
 async def is_subscribed_open_channel(user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(OPEN_CHANNEL.replace("@",""), user_id)
+        # Считаем подписанным, если не вышел и не кикнут
         return member.status not in ("left", "kicked")
     except Exception as e:
         logger.warning(f"Ошибка проверки подписки для {user_id}: {e}")
@@ -302,7 +304,9 @@ async def is_subscribed_open_channel(user_id: int) -> bool:
 
 @dp.callback_query_handler(lambda c: c.data == "recheck")
 async def recheck_subscription(call: types.CallbackQuery):
+    user = await get_or_create_user(call.from_user.id)
     subscribed_open = await is_subscribed_open_channel(call.from_user.id)
+
     if subscribed_open:
         await call.answer("Доступ открыт!", show_alert=False)
         await send_with_photo(
@@ -312,7 +316,7 @@ async def recheck_subscription(call: types.CallbackQuery):
             reply_markup=menu_kb()
         )
     else:
-        await call.answer("Подписка на открытый канал не подтверждена", show_alert=True)
+        await call.answer("Вы не подписаны на канал", show_alert=True)
 
 # ===================== MAIN =====================
 async def on_startup(dp: Dispatcher):
