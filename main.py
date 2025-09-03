@@ -1,19 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-LofiProMailer_Bot — полностью рабочий Telegram-бот на aiogram 2.25
-Функции:
-- /start с реферальной системой
-- Проверка подписки на открытый канал
-- FSM для отправки писем с фото
-- SMTP через список аккаунтов
-- SQLite база для пользователей, логов писем и SMTP
+LofiProMailer_Bot — Aiogram 2.25 с рабочей проверкой подписки через Telethon
 """
 
 import asyncio
 import logging
 import os
 import random
-import re
 from datetime import date
 from typing import List, Optional, Tuple
 
@@ -30,14 +23,34 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 
-# ===================== НАСТРОЙКИ =====================
-API_TOKEN = os.getenv("TG_TOKEN", "7984506224:AAEd3y8AgaP-DjjFqVZ8RfW4Q71yOxgK65w")
+# ====== Telethon для проверки подписки ======
+from telethon import TelegramClient
+from telethon.tl.functions.channels import GetParticipantRequest
+from telethon.errors import UserNotParticipantError
+
+API_ID = 24484081
+API_HASH = 'd80e82b5cadb9ba9201fdfbeccd24326'
+BOT_TOKEN = os.getenv("TG_TOKEN", "7984506224:AAEd3y8AgaP-DjjFqVZ8RfW4Q71yOxgK65w")
+client_tg = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+
+OPEN_CHANNEL_USERNAME = "gmaillofipro"  # без @
+
+async def is_subscribed_open_channel(user_id: int) -> bool:
+    try:
+        await client_tg(GetParticipantRequest(
+            channel=OPEN_CHANNEL_USERNAME,
+            participant=user_id
+        ))
+        return True
+    except UserNotParticipantError:
+        return False
+    except Exception as e:
+        print(f"[Telethon] Ошибка проверки подписки: {e}")
+        return False
+
+# ===================== Настройки =====================
 BOT_USERNAME = os.getenv("BOT_USERNAME", "LofiProMailer_Bot")
 OWNER_ID = int(os.getenv("OWNER_ID", "595041765"))
-
-OPEN_CHANNEL = os.getenv("OPEN_CHANNEL", "gmaillofipro")
-PRIVATE_CHANNEL_FAKE_NAME = "Канал 2"
-
 DAILY_FREE_KEYS = 2
 UNLIMITED_FOR_WHITELIST = True
 BONUS_NAME_TEXT = "@LofiProMailer_Bot"
@@ -81,11 +94,7 @@ CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
     keys_today INTEGER DEFAULT 0,
     last_reset DATE,
-    subscribed INTEGER DEFAULT 0,
     whitelisted INTEGER DEFAULT 0,
-    referrer_id INTEGER,
-    referrals_count INTEGER DEFAULT 0,
-    private_confirmed INTEGER DEFAULT 0,
     bonus_name_last DATE
 );
 """
@@ -121,7 +130,7 @@ class SendMailStates(StatesGroup):
     collecting_photos = State()
     confirming = State()
 
-# ===================== УТИЛИТЫ =====================
+# ===================== Утилиты =====================
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(CREATE_USERS_SQL)
@@ -165,23 +174,6 @@ async def apply_name_bonus_if_needed(user: dict, full_name: str) -> dict:
         user["bonus_name_last"] = today
     return user
 
-async def inc_ref_for_referrer(referrer_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET referrals_count = referrals_count + 1, keys_today = keys_today + 1 WHERE user_id=?", (referrer_id,))
-        await db.commit()
-
-async def save_referrer_if_first_time(user_id: int, referrer_id: Optional[int]):
-    if not referrer_id or referrer_id == user_id:
-        return
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT referrer_id FROM users WHERE user_id=?", (user_id,))
-        row = await cur.fetchone()
-        if row and row["referrer_id"] is None:
-            await db.execute("UPDATE users SET referrer_id=? WHERE user_id=?", (referrer_id, user_id))
-            await db.commit()
-            await inc_ref_for_referrer(referrer_id)
-
 async def pick_smtp_for_today(user_id: int) -> Tuple[str, str]:
     all_logins = list(SMTP_ACCOUNTS.keys())
     today = date.today().isoformat()
@@ -197,35 +189,6 @@ async def pick_smtp_for_today(user_id: int) -> Tuple[str, str]:
         await db.commit()
     return login, pwd
 
-async def send_email_via_smtp(from_login: str, from_pwd: str, to_email: str, subject: str, body: str, attachments: List[str]) -> Tuple[bool, str]:
-    msg = MIMEMultipart()
-    msg['From'] = from_login
-    msg['To'] = to_email
-    msg['Subject'] = subject
-    msg.attach(MIMEText(body, 'plain', 'utf-8'))
-
-    for path in attachments:
-        try:
-            with open(path, 'rb') as f:
-                part = MIMEBase('application', 'octet-stream')
-                part.set_payload(f.read())
-            encoders.encode_base64(part)
-            filename = os.path.basename(path)
-            part.add_header('Content-Disposition', f'attachment; filename="{filename}"')
-            msg.attach(part)
-        except Exception as e:
-            logger.warning(f"Не удалось прикрепить файл {path}: {e}")
-
-    try:
-        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
-        server.starttls()
-        server.login(from_login, from_pwd)
-        server.send_message(msg)
-        server.quit()
-        return True, "OK"
-    except Exception as e:
-        return False, str(e)
-
 async def send_with_photo(bot: Bot, chat_id: int, text: str, reply_markup: Optional[types.InlineKeyboardMarkup]=None, parse_mode: str = "HTML"):
     try:
         files = [f for f in os.listdir(PHOTO_DIR) if f.lower().endswith((".jpg", ".jpeg", ".png", ".gif"))]
@@ -238,7 +201,7 @@ async def send_with_photo(bot: Bot, chat_id: int, text: str, reply_markup: Optio
         logger.warning(f"Ошибка отправки фото: {e}")
     await bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
 
-# ===================== КЛАВИАТУРЫ =====================
+# ===================== Клавиатуры =====================
 def menu_kb() -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
@@ -254,59 +217,38 @@ def menu_kb() -> types.InlineKeyboardMarkup:
 def sub_check_kb() -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
-        types.InlineKeyboardButton("Канал 1", url=f"https://t.me/{OPEN_CHANNEL.replace('@','')}"),
-        types.InlineKeyboardButton(f"{PRIVATE_CHANNEL_FAKE_NAME}", url="https://t.me/+tF_oI1s4EGFhOWUy")
+        types.InlineKeyboardButton("Канал 1", url=f"https://t.me/{OPEN_CHANNEL_USERNAME}"),
     )
     kb.add(
         types.InlineKeyboardButton("🔁 Проверить", callback_data="recheck")
     )
     return kb
 
-# ===================== БОТ =====================
-bot = Bot(API_TOKEN)
+# ===================== Бот =====================
+bot = Bot(BOT_TOKEN)
 dp = Dispatcher(bot, storage=MemoryStorage())
-
-EMAIL_REGEX = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 
 # --------------------- /start ---------------------
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
-    args = message.get_args().strip()
     user = await get_or_create_user(message.from_user.id)
     user = await reset_daily_if_needed(user)
     full_name = " ".join(filter(None, [message.from_user.first_name, message.from_user.last_name or ""]))
     user = await apply_name_bonus_if_needed(user, full_name)
-    try:
-        referrer_id = int(args) if args else None
-    except:
-        referrer_id = None
-    await save_referrer_if_first_time(message.from_user.id, referrer_id)
+
     await send_with_photo(
         bot,
         message.chat.id,
         "<b>Добро пожаловать!</b>\n\n"
-        "<b>Канал 1</b> — подпишись.\n"
-        "<b>Канал 2</b> — подпишись.\n\n"
-        "После подписки нажми <b>Проверить</b> для доступа.",
+        "Подпишитесь на канал ниже и нажмите Проверить.",
         reply_markup=sub_check_kb()
     )
 
 # --------------------- Проверка подписки ---------------------
-# --------------------- Проверка подписки ---------------------
-async def is_subscribed_open_channel(user_id: int) -> bool:
-    try:
-        member = await bot.get_chat_member(OPEN_CHANNEL.replace("@",""), user_id)
-        # Считаем подписанным, если не вышел и не кикнут
-        return member.status in ("creator", "administrator", "member", "restricted")
-    except Exception as e:
-        logger.warning(f"Ошибка проверки подписки для {user_id}: {e}")
-        return False
-
 @dp.callback_query_handler(lambda c: c.data == "recheck")
 async def recheck_subscription(call: types.CallbackQuery):
     user = await get_or_create_user(call.from_user.id)
     subscribed_open = await is_subscribed_open_channel(call.from_user.id)
-
     if subscribed_open:
         await call.answer("Доступ открыт!", show_alert=False)
         await send_with_photo(
@@ -316,12 +258,15 @@ async def recheck_subscription(call: types.CallbackQuery):
             reply_markup=menu_kb()
         )
     else:
-        await call.answer("Вы не подписаны на канал", show_alert=True)
+        await call.answer("Вы не подписаны на канал.", show_alert=True)
 
 # ===================== MAIN =====================
 async def on_startup(dp: Dispatcher):
     await init_db()
     logger.info("DB ready")
+    # Запуск Telethon клиента
+    await client_tg.start()
+    logger.info("Telethon ready")
 
 if __name__ == "__main__":
     asyncio.get_event_loop().run_until_complete(init_db())
