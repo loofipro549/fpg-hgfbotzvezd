@@ -296,8 +296,10 @@ async def cmd_start(message: types.Message):
 async def is_subscribed_open_channel(user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(OPEN_CHANNEL.replace("@",""), user_id)
-        return member.status in ("creator", "administrator", "member", "restricted")
-    except:
+        # считаем подписанным, если он не вышел и не кикнут
+        return member.status not in ("left", "kicked")
+    except Exception as e:
+        logger.warning(f"Ошибка проверки подписки для {user_id}: {e}")
         return False
 
 @dp.callback_query_handler(lambda c: c.data == "confirm_private")
