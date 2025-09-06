@@ -1,26 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-LofiProMailer_Bot — Telegram-бот (aiogram 2.25.1)
-
-Что внутри:
-- Реальная проверка подписки на открытый канал + фейк-подтверждение закрытого
-- Меню: Купить | Рефералы | Отправить письмо | Профиль
-- Ежедневные ключи, безлимит для подписки/вайтлиста, бонус за имя
-- Реферальная система: +1 ключ и +1 счётчик за первого старта по рефке
-- Отправка писем через случайный SMTP + вложения (фото)
-- К каждому ответу прикрепляется случайная картинка из ./photo/ (если есть)
-- Простые админ-команды /sub_on /sub_off /wl_on /wl_off /keys
-
-Подготовка:
-1) Python 3.9+
-2) pip install aiogram==2.25.1 aiosqlite==0.19.0
-3) В проекте создайте папку ./photo/ (положите туда хотя бы одно изображение)
-4) Задайте переменные окружения TG_TOKEN, BOT_USERNAME, OPEN_CHANNEL (или правьте константы ниже)
-5) python bot.py
-
-Внимание: не храните реальные SMTP-пароли в публичных репозиториях.
+Исправленная версия LofiProMailer_Bot — aiogram 2.25.1
 """
-
 import asyncio
 import logging
 import os
@@ -58,8 +39,9 @@ BONUS_NAME_TEXT = "@LofiProMailer_Bot"  # если строка встречае
 
 # Папка с фото
 PHOTO_DIR = os.getenv("PHOTO_DIR", "photo")
+TMP_DIR = "tmp"
 
-# SMTP-настройки
+# SMTP-настройки (оставлены ваши)
 SMTP_ACCOUNTS = {
     "fkspeoadfipa@gmail.com": "wdox jfrh tncs pwic",
     "ao6557424@gmail.com": "mnuy jepq yvyc hjbr",
@@ -153,18 +135,34 @@ async def get_or_create_user(user_id: int) -> dict:
         cur = await db.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
         row = await cur.fetchone()
         if row is None:
+            # создаём с дефолтными ключами
             await db.execute(
                 "INSERT INTO users (user_id, keys_today, last_reset) VALUES (?, ?, ?)",
-                (user_id, 0, date.today().isoformat()),
+                (user_id, DAILY_FREE_KEYS, date.today().isoformat()),
             )
             await db.commit()
             cur = await db.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
             row = await cur.fetchone()
-        return dict(row)
+        data = dict(row)
+        # гарантия наличия ключевых полей (на случай старой БД)
+        defaults = {
+            "keys_today": DAILY_FREE_KEYS,
+            "last_reset": date.today().isoformat(),
+            "subscribed": 0,
+            "whitelisted": 0,
+            "referrer_id": None,
+            "referrals_count": 0,
+            "private_confirmed": 0,
+            "bonus_name_last": None,
+        }
+        for k, v in defaults.items():
+            if k not in data or data.get(k) is None:
+                data[k] = v
+        return data
 
 async def reset_daily_if_needed(user: dict) -> dict:
     today = date.today().isoformat()
-    if user["last_reset"] != today:
+    if user.get("last_reset") != today:
         keys = DAILY_FREE_KEYS
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
@@ -216,14 +214,14 @@ async def save_referrer_if_first_time(user_id: int, referrer_id: Optional[int]):
 
 async def pick_smtp_for_today(user_id: int) -> Tuple[str, str]:
     all_logins = list(SMTP_ACCOUNTS.keys())
+    if not all_logins:
+        raise RuntimeError("SMTP_ACCOUNTS is empty")
     today = date.today().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT smtp_login FROM used_smtp WHERE user_id=? AND day=?",
-            (user_id, today),
-        )
-        used = {r["smtp_login"] for r in await cur.fetchall()}
+        cur = await db.execute("SELECT smtp_login FROM used_smtp WHERE user_id=? AND day=?", (user_id, today))
+        used_rows = await cur.fetchall()
+        used = {r["smtp_login"] for r in used_rows} if used_rows else set()
     available = [x for x in all_logins if x not in used] or all_logins
     login = random.choice(available)
     pwd = SMTP_ACCOUNTS[login].replace(" ", "")
@@ -239,7 +237,7 @@ async def send_email_via_smtp(from_login: str, from_pwd: str, to_email: str, sub
     msg = MIMEMultipart()
     msg["From"] = from_login
     msg["To"] = to_email
-    msg["Subject"] = subject
+    msg["Subject"] = subject or "(без темы)"
 
     msg.attach(MIMEText(body or "", "plain", "utf-8"))
 
@@ -263,6 +261,7 @@ async def send_email_via_smtp(from_login: str, from_pwd: str, to_email: str, sub
             server.send_message(msg)
         return True, "OK"
     except Exception as e:
+        logger.exception("SMTP send error")
         return False, str(e)
 
 async def send_with_photo(bot: Bot, chat_id: int, text: str,
@@ -273,12 +272,14 @@ async def send_with_photo(bot: Bot, chat_id: int, text: str,
                      if f.lower().endswith((".jpg", ".jpeg", ".png", ".gif"))]
             if files:
                 path = os.path.join(PHOTO_DIR, random.choice(files))
+                # откройте файл и ждите отправки (контекст сохранится до окончания await)
                 with open(path, "rb") as ph:
-                    await bot.send_photo(chat_id, photo=ph, caption=text, reply_markup=reply_markup)
+                    await bot.send_photo(chat_id, photo=ph, caption=text, reply_markup=reply_markup, parse_mode=types.ParseMode.HTML)
                 return
     except Exception as e:
         logger.warning(f"Ошибка отправки фото: {e}")
-    await bot.send_message(chat_id, text, reply_markup=reply_markup)
+    # fallback: просто текст
+    await bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=types.ParseMode.HTML)
 
 # ===================== КЛАВИАТУРЫ =====================
 def menu_kb() -> types.InlineKeyboardMarkup:
@@ -359,31 +360,39 @@ async def is_subscribed_open_channel(user_id: int) -> bool:
 
 @dp.callback_query_handler(lambda c: c.data == "confirm_private")
 async def on_confirm_private(call: types.CallbackQuery):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET private_confirmed=1 WHERE user_id=?", (call.from_user.id,))
-        await db.commit()
-    await call.answer("Подтверждение сохранено ✅")
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET private_confirmed=1 WHERE user_id=?", (call.from_user.id,))
+            await db.commit()
+        await call.answer("Подтверждение сохранено ✅")
+    except Exception as e:
+        logger.exception("confirm_private error")
+        await call.answer("Ошибка сохранения", show_alert=True)
 
 @dp.callback_query_handler(lambda c: c.data == "recheck")
 async def on_recheck(call: types.CallbackQuery):
-    user = await get_or_create_user(call.from_user.id)
-    user = await reset_daily_if_needed(user)
+    try:
+        user = await get_or_create_user(call.from_user.id)
+        user = await reset_daily_if_needed(user)
 
-    full_name = " ".join(filter(None, [call.from_user.first_name, call.from_user.last_name or ""]))
-    user = await apply_name_bonus_if_needed(user, full_name)
+        full_name = " ".join(filter(None, [call.from_user.first_name, call.from_user.last_name or ""]))
+        user = await apply_name_bonus_if_needed(user, full_name)
 
-    subscribed_open = await is_subscribed_open_channel(call.from_user.id)
-    if subscribed_open and user.get("private_confirmed") == 1:
-        await call.answer("Доступ открыт!", show_alert=False)
-        await send_with_photo(bot, call.message.chat.id, "<b>Главное меню</b>\n\nВыберите действие ниже.", reply_markup=menu_kb())
-    else:
-        await call.answer("Подписка не подтверждена", show_alert=True)
+        subscribed_open = await is_subscribed_open_channel(call.from_user.id)
+        if subscribed_open and user.get("private_confirmed") == 1:
+            await call.answer("Доступ открыт!", show_alert=False)
+            await send_with_photo(bot, call.message.chat.id, "<b>Главное меню</b>\n\nВыберите действие ниже.", reply_markup=menu_kb())
+        else:
+            await call.answer("Подписка не подтверждена", show_alert=True)
+    except Exception:
+        logger.exception("recheck error")
+        await call.answer("Ошибка проверки", show_alert=True)
 
 @dp.callback_query_handler(lambda c: c.data == "profile")
 async def on_profile(call: types.CallbackQuery):
     user = await get_or_create_user(call.from_user.id)
     user = await reset_daily_if_needed(user)
-    unlimited = (user["subscribed"] == 1) or (UNLIMITED_FOR_WHITELIST and user["whitelisted"] == 1)
+    unlimited = (user.get("subscribed") == 1) or (UNLIMITED_FOR_WHITELIST and user.get("whitelisted") == 1)
     status = "Активна" if unlimited else "Не активна"
     keys_text = "∞" if unlimited else str(user.get("keys_today", 0))
 
@@ -438,7 +447,7 @@ async def on_buy(call: types.CallbackQuery):
 async def on_send(call: types.CallbackQuery, state: FSMContext):
     user = await get_or_create_user(call.from_user.id)
     user = await reset_daily_if_needed(user)
-    unlimited = (user["subscribed"] == 1) or (UNLIMITED_FOR_WHITELIST and user["whitelisted"] == 1)
+    unlimited = (user.get("subscribed") == 1) or (UNLIMITED_FOR_WHITELIST and user.get("whitelisted") == 1)
 
     if (not unlimited) and user.get("keys_today", 0) <= 0:
         await send_with_photo(
@@ -493,7 +502,7 @@ async def fsm_photos_choice(call: types.CallbackQuery, state: FSMContext):
         await send_with_photo(
             bot,
             call.message.chat.id,
-            "📎 <b>Отправляйте фото(графии) одно за другим.</b>\nКогда закончите — нажмите <b>Готово</b>.",
+            "📎 <b>Отправляйте фотографии одно за другим.</b>\nКогда закончите — нажмите <b>Готово</b>.",
             reply_markup=kb
         )
     else:
@@ -512,13 +521,17 @@ async def fsm_photos_choice(call: types.CallbackQuery, state: FSMContext):
 
 @dp.message_handler(content_types=types.ContentTypes.PHOTO, state=SendMailStates.collecting_photos)
 async def fsm_collect_photos(message: types.Message, state: FSMContext):
-    os.makedirs("tmp", exist_ok=True)
+    os.makedirs(TMP_DIR, exist_ok=True)
     if not message.photo:
         return
     biggest = message.photo[-1]
     file = await bot.get_file(biggest.file_id)
-    dst = os.path.join("tmp", f"{message.from_user.id}_{biggest.file_unique_id}.jpg")
-    await bot.download_file(file.file_path, dst)
+    dst = os.path.join(TMP_DIR, f"{message.from_user.id}_{biggest.file_unique_id}.jpg")
+    try:
+        await bot.download_file(file.file_path, dst)
+    except Exception:
+        # fallback: use download_file of message
+        await message.download(dst)
 
     data = await state.get_data()
     atts = list(data.get("attachments", []))
@@ -536,7 +549,7 @@ async def fsm_photos_done(call: types.CallbackQuery, state: FSMContext):
         call.message.chat.id,
         "<b>Подтверждение отправки</b>\n\n"
         f"Кому: <code>{data.get('to_email')}</code>\n"
-        f"Тема: {data.get('subject')}</b>\n"
+        f"Тема: {data.get('subject')}\n"
         f"Вложений: {len(data.get('attachments', []))}\n\n"
         "Отправить?",
         reply_markup=confirm_mail_kb()
@@ -553,15 +566,23 @@ async def fsm_confirm_send(call: types.CallbackQuery, state: FSMContext):
 
     user = await get_or_create_user(call.from_user.id)
     user = await reset_daily_if_needed(user)
-    unlimited = (user["subscribed"] == 1) or (UNLIMITED_FOR_WHITELIST and user["whitelisted"] == 1)
+    unlimited = (user.get("subscribed") == 1) or (UNLIMITED_FOR_WHITELIST and user.get("whitelisted") == 1)
 
     data = await state.get_data()
     to_email = data.get("to_email")
     subject = data.get("subject", "(без темы)")
     body = data.get("body", "")
-    attachments = data.get("attachments", [])
+    attachments = data.get("attachments", []) or []
 
-    login, pwd = await pick_smtp_for_today(call.from_user.id)
+    try:
+        login, pwd = await pick_smtp_for_today(call.from_user.id)
+    except Exception as e:
+        logger.exception("No SMTP available")
+        await send_with_photo(bot, call.message.chat.id, "<b>Ошибка:</b> нет доступных SMTP-аккаунтов.", reply_markup=menu_kb())
+        await state.finish()
+        await call.answer()
+        return
+
     ok, err = await send_email_via_smtp(login, pwd, to_email, subject, body, attachments)
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -671,7 +692,7 @@ async def fallback(message: types.Message):
 # ===================== MAIN =====================
 async def on_startup(dp: Dispatcher):
     os.makedirs(PHOTO_DIR, exist_ok=True)
-    os.makedirs("tmp", exist_ok=True)
+    os.makedirs(TMP_DIR, exist_ok=True)
     await init_db()
     logger.info("DB ready")
 
