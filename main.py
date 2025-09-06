@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Исправленная версия LofiProMailer_Bot — aiogram 2.25.1
+LofiProMailer_Bot — улучшенная версия (aiogram 2.25.1)
+
+Замените константы (TG_TOKEN, OWNER_ID, OPEN_CHANNEL) при необходимости.
 """
 import asyncio
 import logging
@@ -8,7 +10,9 @@ import os
 import random
 import re
 import aiosqlite
-from datetime import date
+import shutil
+import time
+from datetime import date, datetime, timedelta
 from typing import List, Optional, Tuple
 
 from aiogram import Bot, Dispatcher, types
@@ -70,10 +74,10 @@ SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
 
 # ===================== ЛОГИ =====================
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("LofiProMailer_Bot")
 
-# ===================== ХРАНИЛИЩЕ =====================
+# ===================== БД =====================
 DB_PATH = "LofiProMailer_Bot.db"
 
 CREATE_USERS_SQL = """
@@ -89,7 +93,6 @@ CREATE TABLE IF NOT EXISTS users (
     bonus_name_last DATE
 );
 """
-
 CREATE_MAIL_LOG_SQL = """
 CREATE TABLE IF NOT EXISTS mail_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,7 +105,6 @@ CREATE TABLE IF NOT EXISTS mail_log (
     day TEXT
 );
 """
-
 CREATE_USED_SMTP_SQL = """
 CREATE TABLE IF NOT EXISTS used_smtp (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -135,7 +137,6 @@ async def get_or_create_user(user_id: int) -> dict:
         cur = await db.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
         row = await cur.fetchone()
         if row is None:
-            # создаём с дефолтными ключами
             await db.execute(
                 "INSERT INTO users (user_id, keys_today, last_reset) VALUES (?, ?, ?)",
                 (user_id, DAILY_FREE_KEYS, date.today().isoformat()),
@@ -144,7 +145,7 @@ async def get_or_create_user(user_id: int) -> dict:
             cur = await db.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
             row = await cur.fetchone()
         data = dict(row)
-        # гарантия наличия ключевых полей (на случай старой БД)
+        # гарантируем поля
         defaults = {
             "keys_today": DAILY_FREE_KEYS,
             "last_reset": date.today().isoformat(),
@@ -156,7 +157,7 @@ async def get_or_create_user(user_id: int) -> dict:
             "bonus_name_last": None,
         }
         for k, v in defaults.items():
-            if k not in data or data.get(k) is None:
+            if data.get(k) is None:
                 data[k] = v
         return data
 
@@ -165,10 +166,7 @@ async def reset_daily_if_needed(user: dict) -> dict:
     if user.get("last_reset") != today:
         keys = DAILY_FREE_KEYS
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE users SET keys_today=?, last_reset=? WHERE user_id=?",
-                (keys, today, user["user_id"]),
-            )
+            await db.execute("UPDATE users SET keys_today=?, last_reset=? WHERE user_id=?", (keys, today, user["user_id"]))
             await db.execute("DELETE FROM used_smtp WHERE user_id=? AND day != ?", (user["user_id"], today))
             await db.commit()
         user["keys_today"] = keys
@@ -179,14 +177,9 @@ async def apply_name_bonus_if_needed(user: dict, full_name: str) -> dict:
     today = date.today().isoformat()
     if user.get("bonus_name_last") == today:
         return user
-    needle = BONUS_NAME_TEXT.replace("@", "").lower()
-    full = (full_name or "").replace("@", "").lower()
-    if needle and needle in full:
+    if full_name and BONUS_NAME_TEXT.replace("@", "").lower() in full_name.replace("@", "").lower():
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE users SET keys_today = keys_today + 1, bonus_name_last=? WHERE user_id=?",
-                (today, user["user_id"]),
-            )
+            await db.execute("UPDATE users SET keys_today = keys_today + 1, bonus_name_last=? WHERE user_id=?", (today, user["user_id"]))
             await db.commit()
         user["keys_today"] = user.get("keys_today", 0) + 1
         user["bonus_name_last"] = today
@@ -194,10 +187,7 @@ async def apply_name_bonus_if_needed(user: dict, full_name: str) -> dict:
 
 async def inc_ref_for_referrer(referrer_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET referrals_count = referrals_count + 1, keys_today = keys_today + 1 WHERE user_id=?",
-            (referrer_id,),
-        )
+        await db.execute("UPDATE users SET referrals_count = referrals_count + 1, keys_today = keys_today + 1 WHERE user_id=?", (referrer_id,))
         await db.commit()
 
 async def save_referrer_if_first_time(user_id: int, referrer_id: Optional[int]):
@@ -220,16 +210,13 @@ async def pick_smtp_for_today(user_id: int) -> Tuple[str, str]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT smtp_login FROM used_smtp WHERE user_id=? AND day=?", (user_id, today))
-        used_rows = await cur.fetchall()
-        used = {r["smtp_login"] for r in used_rows} if used_rows else set()
+        rows = await cur.fetchall()
+        used = {r["smtp_login"] for r in rows} if rows else set()
     available = [x for x in all_logins if x not in used] or all_logins
     login = random.choice(available)
     pwd = SMTP_ACCOUNTS[login].replace(" ", "")
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO used_smtp (user_id, smtp_login, day) VALUES (?, ?, ?)",
-            (user_id, login, today),
-        )
+        await db.execute("INSERT INTO used_smtp (user_id, smtp_login, day) VALUES (?, ?, ?)", (user_id, login, today))
         await db.commit()
     return login, pwd
 
@@ -238,7 +225,6 @@ async def send_email_via_smtp(from_login: str, from_pwd: str, to_email: str, sub
     msg["From"] = from_login
     msg["To"] = to_email
     msg["Subject"] = subject or "(без темы)"
-
     msg.attach(MIMEText(body or "", "plain", "utf-8"))
 
     for path in attachments or []:
@@ -250,10 +236,10 @@ async def send_email_via_smtp(from_login: str, from_pwd: str, to_email: str, sub
             part.add_header("Content-Disposition", f'attachment; filename="{os.path.basename(path)}"')
             msg.attach(part)
         except Exception as e:
-            logger.warning(f"Не удалось прикрепить файл {path}: {e}")
+            logger.warning("Не удалось прикрепить файл %s: %s", path, e)
 
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
             server.ehlo()
             server.starttls()
             server.ehlo()
@@ -261,95 +247,115 @@ async def send_email_via_smtp(from_login: str, from_pwd: str, to_email: str, sub
             server.send_message(msg)
         return True, "OK"
     except Exception as e:
-        logger.exception("SMTP send error")
+        logger.exception("SMTP error")
         return False, str(e)
 
-async def send_with_photo(bot: Bot, chat_id: int, text: str,
-                         reply_markup: Optional[types.InlineKeyboardMarkup] = None):
+async def cleanup_tmp_files(files: List[str]=None, keep_hours: int=24):
+    """
+    Если files переданы — попытаться удалить конкретные файлы.
+    И удалить все файлы старше keep_hours в TMP_DIR.
+    """
+    try:
+        if files:
+            for p in files:
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except Exception:
+                    logger.warning("Не удалось удалить временный файл %s", p)
+        # удаляем старые
+        if os.path.isdir(TMP_DIR):
+            now = time.time()
+            for fname in os.listdir(TMP_DIR):
+                fpath = os.path.join(TMP_DIR, fname)
+                try:
+                    if os.path.isfile(fpath):
+                        mtime = os.path.getmtime(fpath)
+                        if now - mtime > keep_hours * 3600:
+                            os.remove(fpath)
+                except Exception:
+                    pass
+    except Exception:
+        logger.exception("cleanup_tmp_files error")
+
+async def send_with_photo(bot: Bot, chat_id: int, text: str, reply_markup: Optional[types.InlineKeyboardMarkup]=None):
     try:
         if os.path.isdir(PHOTO_DIR):
-            files = [f for f in os.listdir(PHOTO_DIR)
-                     if f.lower().endswith((".jpg", ".jpeg", ".png", ".gif"))]
+            files = [f for f in os.listdir(PHOTO_DIR) if f.lower().endswith((".jpg", ".jpeg", ".png", ".gif"))]
             if files:
                 path = os.path.join(PHOTO_DIR, random.choice(files))
-                # откройте файл и ждите отправки (контекст сохранится до окончания await)
                 with open(path, "rb") as ph:
                     await bot.send_photo(chat_id, photo=ph, caption=text, reply_markup=reply_markup, parse_mode=types.ParseMode.HTML)
                 return
-    except Exception as e:
-        logger.warning(f"Ошибка отправки фото: {e}")
-    # fallback: просто текст
+    except Exception:
+        logger.exception("send_with_photo error")
     await bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=types.ParseMode.HTML)
 
 # ===================== КЛАВИАТУРЫ =====================
 def menu_kb() -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("💳 Купить подписку", callback_data="buy"),
-        types.InlineKeyboardButton("👥 Реферальная система", callback_data="ref"),
-    )
-    kb.add(
-        types.InlineKeyboardButton("✉️ Отправить письмо", callback_data="send"),
-        types.InlineKeyboardButton("👤 Профиль", callback_data="profile"),
-    )
+    kb.add(types.InlineKeyboardButton("💳 Купить подписку", callback_data="buy"),
+           types.InlineKeyboardButton("👥 Реферальная система", callback_data="ref"))
+    kb.add(types.InlineKeyboardButton("✉️ Отправить письмо", callback_data="send"),
+           types.InlineKeyboardButton("👤 Профиль", callback_data="profile"))
     return kb
 
 def sub_check_kb() -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(types.InlineKeyboardButton("Канал 1", url=f"https://t.me/{OPEN_CHANNEL.replace('@','')}"))
     kb.add(types.InlineKeyboardButton(PRIVATE_CHANNEL_FAKE_NAME, url="https://t.me/+tF_oI1s4EGFhOWUy"))
-    kb.add(
-        types.InlineKeyboardButton("✅ Я подписался", callback_data="confirm_private"),
-        types.InlineKeyboardButton("🔁 Проверить", callback_data="recheck"),
-    )
+    kb.add(types.InlineKeyboardButton("✅ Я подписался", callback_data="confirm_private"),
+           types.InlineKeyboardButton("🔁 Проверить", callback_data="recheck"))
     return kb
 
 def confirm_mail_kb() -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("✅ Да", callback_data="confirm_send"),
-        types.InlineKeyboardButton("❌ Нет", callback_data="cancel_send"),
-    )
+    kb.add(types.InlineKeyboardButton("✅ Да", callback_data="confirm_send"),
+           types.InlineKeyboardButton("❌ Нет", callback_data="cancel_send"))
     return kb
 
 # ===================== БОТ =====================
 bot = Bot(API_TOKEN, parse_mode=types.ParseMode.HTML)
 dp = Dispatcher(bot, storage=MemoryStorage())
 
+# централизованный обработчик ошибок (логирование)
+@dp.errors_handler()
+async def global_errors_handler(update, exception):
+    logger.exception("Unhandled error: %s | update: %s", exception, getattr(update, "update_id", update))
+    return True  # считаем ошибку обработанной
+
 # ===================== ХЭНДЛЕРЫ =====================
 EMAIL_REGEX = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 
-# /start с рефкодом
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
-    args_raw = message.get_args() or ""
-    args = args_raw.strip()
-    user = await get_or_create_user(message.from_user.id)
-    user = await reset_daily_if_needed(user)
-
-    full_name = " ".join(
-        filter(None, [message.from_user.first_name, (message.from_user.last_name or "")])
-    )
-    user = await apply_name_bonus_if_needed(user, full_name)
-
-    # сохраняем реферера при первом запуске
-    referrer_id = None
     try:
-        if args:
-            referrer_id = int(args)
-    except Exception:
-        referrer_id = None
-    await save_referrer_if_first_time(message.from_user.id, referrer_id)
+        args_raw = message.get_args() or ""
+        args = args_raw.strip()
+        user = await get_or_create_user(message.from_user.id)
+        user = await reset_daily_if_needed(user)
 
-    await send_with_photo(
-        bot,
-        message.chat.id,
-        "<b>Добро пожаловать!</b>\n\n"
-        "<b>Канал 1</b> — подпишись.\n"
-        f"<b>Канал 2</b> — подпишись.\n\n"
-        "После подписки нажми <b>Проверить</b> для доступа.",
-        reply_markup=sub_check_kb()
-    )
+        full_name = " ".join(filter(None, [message.from_user.first_name, (message.from_user.last_name or "")]))
+        user = await apply_name_bonus_if_needed(user, full_name)
+
+        referrer_id = None
+        try:
+            if args:
+                referrer_id = int(args)
+        except Exception:
+            referrer_id = None
+        await save_referrer_if_first_time(message.from_user.id, referrer_id)
+
+        await send_with_photo(bot, message.chat.id,
+            "<b>Добро пожаловать!</b>\n\n"
+            "<b>Канал 1</b> — подпишись.\n"
+            f"<b>Канал 2</b> — подпишись.\n\n"
+            "После подписки нажми <b>Проверить</b> для доступа.",
+            reply_markup=sub_check_kb()
+        )
+    except Exception:
+        logger.exception("cmd_start error")
+        await message.reply("Внутренняя ошибка. Попробуйте позже.")
 
 async def is_subscribed_open_channel(user_id: int) -> bool:
     try:
@@ -365,7 +371,7 @@ async def on_confirm_private(call: types.CallbackQuery):
             await db.execute("UPDATE users SET private_confirmed=1 WHERE user_id=?", (call.from_user.id,))
             await db.commit()
         await call.answer("Подтверждение сохранено ✅")
-    except Exception as e:
+    except Exception:
         logger.exception("confirm_private error")
         await call.answer("Ошибка сохранения", show_alert=True)
 
@@ -374,10 +380,8 @@ async def on_recheck(call: types.CallbackQuery):
     try:
         user = await get_or_create_user(call.from_user.id)
         user = await reset_daily_if_needed(user)
-
         full_name = " ".join(filter(None, [call.from_user.first_name, call.from_user.last_name or ""]))
         user = await apply_name_bonus_if_needed(user, full_name)
-
         subscribed_open = await is_subscribed_open_channel(call.from_user.id)
         if subscribed_open and user.get("private_confirmed") == 1:
             await call.answer("Доступ открыт!", show_alert=False)
@@ -390,48 +394,49 @@ async def on_recheck(call: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data == "profile")
 async def on_profile(call: types.CallbackQuery):
-    user = await get_or_create_user(call.from_user.id)
-    user = await reset_daily_if_needed(user)
-    unlimited = (user.get("subscribed") == 1) or (UNLIMITED_FOR_WHITELIST and user.get("whitelisted") == 1)
-    status = "Активна" if unlimited else "Не активна"
-    keys_text = "∞" if unlimited else str(user.get("keys_today", 0))
-
-    await send_with_photo(
-        bot,
-        call.message.chat.id,
-        "<b>👤 Профиль</b>\n\n"
-        f"<b>🆔 ID:</b> <code>{call.from_user.id}</code>\n"
-        f"<b>🔷 Ключи:</b> {keys_text}\n"
-        f"<b>🎟 Подписка:</b> {status}",
-        reply_markup=menu_kb()
-    )
-    await call.answer()
+    try:
+        user = await get_or_create_user(call.from_user.id)
+        user = await reset_daily_if_needed(user)
+        unlimited = (user.get("subscribed") == 1) or (UNLIMITED_FOR_WHITELIST and user.get("whitelisted") == 1)
+        status = "Активна" if unlimited else "Не активна"
+        keys_text = "∞" if unlimited else str(user.get("keys_today", 0))
+        await send_with_photo(bot, call.message.chat.id,
+            "<b>👤 Профиль</b>\n\n"
+            f"<b>🆔 ID:</b> <code>{call.from_user.id}</code>\n"
+            f"<b>🔷 Ключи:</b> {keys_text}\n"
+            f"<b>🎟 Подписка:</b> {status}",
+            reply_markup=menu_kb()
+        )
+        await call.answer()
+    except Exception:
+        logger.exception("on_profile error")
+        await call.answer("Ошибка", show_alert=True)
 
 @dp.callback_query_handler(lambda c: c.data == "ref")
 async def on_ref(call: types.CallbackQuery):
-    link = f"https://t.me/{BOT_USERNAME}?start={call.from_user.id}"
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT referrals_count FROM users WHERE user_id=?", (call.from_user.id,))
-        row = await cur.fetchone()
-        count = (row["referrals_count"] if row else 0) or 0
-    await send_with_photo(
-        bot,
-        call.message.chat.id,
-        "<b>👥 Реферальная система</b>\n\n"
-        f"<b>Рефералы:</b> {count}\n\n"
-        f"<b>🔗 Реферальная ссылка:</b>\n<code>{link}</code>\n\n"
-        "За один переход по рефке — <b>+1 ключ</b>.\n"
-        f"🎁 Бонус за имя: укажите <b>{BONUS_NAME_TEXT}</b> в имени — получите <b>+1 ключ</b> при первом запуске бота в день.",
-        reply_markup=menu_kb()
-    )
-    await call.answer()
+    try:
+        link = f"https://t.me/{BOT_USERNAME}?start={call.from_user.id}"
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT referrals_count FROM users WHERE user_id=?", (call.from_user.id,))
+            row = await cur.fetchone()
+            count = (row["referrals_count"] if row else 0) or 0
+        await send_with_photo(bot, call.message.chat.id,
+            "<b>👥 Реферальная система</b>\n\n"
+            f"<b>Рефералы:</b> {count}\n\n"
+            f"<b>🔗 Реферальная ссылка:</b>\n<code>{link}</code>\n\n"
+            "За один переход по рефке — <b>+1 ключ</b>.\n"
+            f"🎁 Бонус за имя: укажите <b>{BONUS_NAME_TEXT}</b> в имени — получите <b>+1 ключ</b> при первом запуске бота в день.",
+            reply_markup=menu_kb()
+        )
+        await call.answer()
+    except Exception:
+        logger.exception("on_ref error")
+        await call.answer("Ошибка", show_alert=True)
 
 @dp.callback_query_handler(lambda c: c.data == "buy")
 async def on_buy(call: types.CallbackQuery):
-    await send_with_photo(
-        bot,
-        call.message.chat.id,
+    await send_with_photo(bot, call.message.chat.id,
         "<b>Оформление подписки</b>\n\n"
         "<b>💠 После покупки вы получаете:</b>\n"
         "• Полный доступ к письмам\n"
@@ -445,24 +450,21 @@ async def on_buy(call: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data == "send")
 async def on_send(call: types.CallbackQuery, state: FSMContext):
-    user = await get_or_create_user(call.from_user.id)
-    user = await reset_daily_if_needed(user)
-    unlimited = (user.get("subscribed") == 1) or (UNLIMITED_FOR_WHITELIST and user.get("whitelisted") == 1)
-
-    if (not unlimited) and user.get("keys_today", 0) <= 0:
-        await send_with_photo(
-            bot,
-            call.message.chat.id,
-            "<b>У вас нет ключей на сегодня.</b> Купите подписку или получите ключ по рефералке/бонусу имени.",
-            reply_markup=menu_kb()
-        )
+    try:
+        user = await get_or_create_user(call.from_user.id)
+        user = await reset_daily_if_needed(user)
+        unlimited = (user.get("subscribed") == 1) or (UNLIMITED_FOR_WHITELIST and user.get("whitelisted") == 1)
+        if (not unlimited) and user.get("keys_today", 0) <= 0:
+            await send_with_photo(bot, call.message.chat.id, "<b>У вас нет ключей на сегодня.</b> Купите подписку или получите ключ по рефералке/бонусу имени.", reply_markup=menu_kb())
+            await call.answer()
+            return
+        await state.update_data(attachments=[])
+        await SendMailStates.asking_target.set()
+        await send_with_photo(bot, call.message.chat.id, "<b>Вы действительно хотите отправить письмо?</b>\n\nОтправьте <b>email получателя</b>.")
         await call.answer()
-        return
-
-    await state.update_data(attachments=[])
-    await SendMailStates.asking_target.set()
-    await send_with_photo(bot, call.message.chat.id, "<b>Вы действительно хотите отправить письмо?</b>\n\nОтправьте <b>email получателя</b>.")
-    await call.answer()
+    except Exception:
+        logger.exception("on_send error")
+        await call.answer("Ошибка", show_alert=True)
 
 @dp.message_handler(state=SendMailStates.asking_target, content_types=types.ContentTypes.TEXT)
 async def fsm_target(message: types.Message, state: FSMContext):
@@ -486,31 +488,19 @@ async def fsm_body(message: types.Message, state: FSMContext):
     body = (message.text or "").strip()
     await state.update_data(body=body)
     await SendMailStates.asking_photos.set()
-    kb = types.InlineKeyboardMarkup().add(
-        types.InlineKeyboardButton("Да", callback_data="add_photos_yes"),
-        types.InlineKeyboardButton("Нет", callback_data="add_photos_no"),
-    )
+    kb = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("Да", callback_data="add_photos_yes"), types.InlineKeyboardButton("Нет", callback_data="add_photos_no"))
     await send_with_photo(bot, message.chat.id, "🖼 <b>Хотите добавить фотографии?</b>", reply_markup=kb)
 
 @dp.callback_query_handler(lambda c: c.data in ("add_photos_yes", "add_photos_no"), state=SendMailStates.asking_photos)
 async def fsm_photos_choice(call: types.CallbackQuery, state: FSMContext):
     if call.data == "add_photos_yes":
         await SendMailStates.collecting_photos.set()
-        kb = types.InlineKeyboardMarkup().add(
-            types.InlineKeyboardButton("Готово", callback_data="photos_done")
-        )
-        await send_with_photo(
-            bot,
-            call.message.chat.id,
-            "📎 <b>Отправляйте фотографии одно за другим.</b>\nКогда закончите — нажмите <b>Готово</b>.",
-            reply_markup=kb
-        )
+        kb = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("Готово", callback_data="photos_done"))
+        await send_with_photo(bot, call.message.chat.id, "📎 <b>Отправляйте фотографии одно за другим.</b>\nКогда закончите — нажмите <b>Готово</b>.", reply_markup=kb)
     else:
         data = await state.get_data()
         await SendMailStates.confirming.set()
-        await send_with_photo(
-            bot,
-            call.message.chat.id,
+        await send_with_photo(bot, call.message.chat.id,
             "<b>Подтверждение отправки</b>\n\n"
             f"Кому: <code>{data.get('to_email')}</code>\n"
             f"Тема: {data.get('subject')}\n\n"
@@ -525,28 +515,28 @@ async def fsm_collect_photos(message: types.Message, state: FSMContext):
     if not message.photo:
         return
     biggest = message.photo[-1]
-    file = await bot.get_file(biggest.file_id)
     dst = os.path.join(TMP_DIR, f"{message.from_user.id}_{biggest.file_unique_id}.jpg")
     try:
-        await bot.download_file(file.file_path, dst)
+        # стараемся использовать message.download (наиболее надёжно)
+        await message.download(destination_file=dst)
     except Exception:
-        # fallback: use download_file of message
-        await message.download(dst)
-
+        try:
+            file = await bot.get_file(biggest.file_id)
+            await bot.download_file(file.file_path, dst)
+        except Exception:
+            logger.exception("download photo error")
+            return
     data = await state.get_data()
     atts = list(data.get("attachments", []))
     atts.append(dst)
     await state.update_data(attachments=atts)
-
     await send_with_photo(bot, message.chat.id, f"Добавлено фото. Всего вложений: <b>{len(atts)}</b>.")
 
 @dp.callback_query_handler(lambda c: c.data == "photos_done", state=SendMailStates.collecting_photos)
 async def fsm_photos_done(call: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     await SendMailStates.confirming.set()
-    await send_with_photo(
-        bot,
-        call.message.chat.id,
+    await send_with_photo(bot, call.message.chat.id,
         "<b>Подтверждение отправки</b>\n\n"
         f"Кому: <code>{data.get('to_email')}</code>\n"
         f"Тема: {data.get('subject')}\n"
@@ -564,21 +554,21 @@ async def fsm_confirm_send(call: types.CallbackQuery, state: FSMContext):
         await call.answer()
         return
 
-    user = await get_or_create_user(call.from_user.id)
-    user = await reset_daily_if_needed(user)
-    unlimited = (user.get("subscribed") == 1) or (UNLIMITED_FOR_WHITELIST and user.get("whitelisted") == 1)
-
     data = await state.get_data()
     to_email = data.get("to_email")
     subject = data.get("subject", "(без темы)")
     body = data.get("body", "")
     attachments = data.get("attachments", []) or []
 
+    user = await get_or_create_user(call.from_user.id)
+    user = await reset_daily_if_needed(user)
+    unlimited = (user.get("subscribed") == 1) or (UNLIMITED_FOR_WHITELIST and user.get("whitelisted") == 1)
+
     try:
         login, pwd = await pick_smtp_for_today(call.from_user.id)
-    except Exception as e:
-        logger.exception("No SMTP available")
-        await send_with_photo(bot, call.message.chat.id, "<b>Ошибка:</b> нет доступных SMTP-аккаунтов.", reply_markup=menu_kb())
+    except Exception:
+        logger.exception("pick_smtp_for_today error")
+        await send_with_photo(bot, call.message.chat.id, "<b>Ошибка:</b> нет доступных SMTP.", reply_markup=menu_kb())
         await state.finish()
         await call.answer()
         return
@@ -586,20 +576,19 @@ async def fsm_confirm_send(call: types.CallbackQuery, state: FSMContext):
     ok, err = await send_email_via_smtp(login, pwd, to_email, subject, body, attachments)
 
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO mail_log (user_id, to_email, subject, body, smtp_used, day) VALUES (?, ?, ?, ?, ?, ?)",
-            (call.from_user.id, to_email, subject, body, login, date.today().isoformat()),
-        )
+        await db.execute("INSERT INTO mail_log (user_id, to_email, subject, body, smtp_used, day) VALUES (?, ?, ?, ?, ?, ?)",
+                         (call.from_user.id, to_email, subject, body, login, date.today().isoformat()))
         if ok and (not unlimited):
             await db.execute("UPDATE users SET keys_today = keys_today - 1 WHERE user_id=?", (call.from_user.id,))
         await db.commit()
 
+    # удаляем временные файлы, только те что использовались
+    await cleanup_tmp_files(files=attachments, keep_hours=24)
+
     await state.finish()
 
     if ok:
-        await send_with_photo(
-            bot,
-            call.message.chat.id,
+        await send_with_photo(bot, call.message.chat.id,
             "<b>Готово!</b> Письмо отправлено.\n\n"
             f"<b>Кому:</b> <code>{to_email}</code>\n"
             f"<b>Тема:</b> {subject}\n"
@@ -609,7 +598,6 @@ async def fsm_confirm_send(call: types.CallbackQuery, state: FSMContext):
         )
     else:
         await send_with_photo(bot, call.message.chat.id, f"<b>Ошибка отправки:</b> {err}", reply_markup=menu_kb())
-
     await call.answer()
 
 # ===================== АДМИН-КОМАНДЫ =====================
@@ -697,6 +685,5 @@ async def on_startup(dp: Dispatcher):
     logger.info("DB ready")
 
 if __name__ == "__main__":
-    # init_db продублирован на случай старта без on_startup
     asyncio.get_event_loop().run_until_complete(init_db())
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
