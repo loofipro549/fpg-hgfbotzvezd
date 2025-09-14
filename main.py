@@ -42,7 +42,7 @@ UNLIMITED_FOR_WHITELIST = True
 BONUS_NAME_TEXT = "@LofiProMailer_Bot"  # если строка встречается в имени — +1 ключ/день
 
 # Папка с фото
-PHOTO_DIR = os.getenv("PHOTO_DIR", "photo")
+PHOTO_DIR = os.getenv("photo", "1")
 TMP_DIR = "tmp"
 
 # SMTP-настройки (оставлены ваши)
