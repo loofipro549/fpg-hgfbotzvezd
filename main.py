@@ -7,6 +7,9 @@ from telethon.tl.functions.contacts import ResolveUsernameRequest
 from telethon import TelegramClient, errors
 import os
 import asyncio
+import logging
+
+logging.basicConfig(level=logging.INFO)
 
 # === НАСТРОЙКИ ===
 TOKEN = "8077285651:AAEeKuRuxPVtmglrqmvC5AlIhmz8lKOLX9M"
@@ -87,26 +90,26 @@ async def send_invite(username: str):
                     result = await client(ResolveUsernameRequest(username[1:]))
                     entity = result.users[0]
                 except IndexError:
-                    print(f"[FAIL] {s}: Пользователь {username} не найден через username")
+                    logging.info(f"[FAIL] {s}: Пользователь {username} не найден через username")
                     continue
                 await client.send_message(entity, f"✅ Добро пожаловать!\n{INVITE_LINK}")
-                print(f"[OK] Сообщение отправлено с {s} пользователю {username}")
+                logging.info(f"[OK] Сообщение отправлено с {s} пользователю {username}")
                 await asyncio.sleep(2)
                 return True
         except errors.FloodWaitError as e:
-            print(f"[LIMIT] {s} достиг лимита, ждём {e.seconds} секунд")
+            logging.warning(f"[LIMIT] {s} достиг лимита, ждём {e.seconds} секунд")
             await asyncio.sleep(e.seconds)
             continue
         except errors.ChatWriteForbiddenError:
-            print(f"[FAIL] {s} не может писать пользователю {username}")
+            logging.info(f"[FAIL] {s} не может писать пользователю {username}")
             continue
         except Exception as e:
-            print(f"[ERROR] {s}: {e}")
+            logging.exception(f"[ERROR] {s}: {e}")
             continue
-    print(f"[FAIL] Не удалось отправить пользователю {username}")
+    logging.info(f"[FAIL] Не удалось отправить пользователю {username}")
     return False
 
-# === Хэндлеры ===
+# === Исправленная логика опроса (callback_data — индексы) ===
 @dp.message_handler(commands="start")
 async def start(message: types.Message, state: FSMContext):
     user_ids = load_ids()
@@ -120,64 +123,101 @@ async def start(message: types.Message, state: FSMContext):
         'Чтобы подать заявку на вступление в клан "Кровавое Господство" необходимо иметь юз. Хотите ли вы вступить?',
         reply_markup=kb
     )
+    # начинаем с чистых данных (на всякий случай)
     await state.finish()
 
 @dp.callback_query_handler(lambda c: c.data == "start_no")
 async def process_no(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
     await call.message.edit_text("Спасибо, что пришли. Ждём вас ещё.")
     await state.finish()
 
 @dp.callback_query_handler(lambda c: c.data == "start_yes")
 async def process_yes(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
     await state.update_data(score=0, osint=False)
     await ask_question(call.message, state, 0)
 
 async def ask_question(message, state, index):
     kb = InlineKeyboardMarkup()
-    for option in questions[index]["options"]:
-        kb.add(InlineKeyboardButton(option, callback_data=f"q{index}_{option}"))
+    options = list(questions[index]["options"].keys())
+    for i, opt_text in enumerate(options):
+        # callback: q{question_index}_{option_index}
+        kb.add(InlineKeyboardButton(opt_text, callback_data=f"q{index}_{i}"))
     await message.answer(questions[index]["text"], reply_markup=kb)
     await state.set_state(getattr(Form, f"q{index+1}"))
 
 @dp.callback_query_handler(lambda c: c.data.startswith("q"), state=[Form.q1, Form.q2, Form.q3, Form.q4])
 async def process_answer(call: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    idx, option = call.data.split("_", 1)
-    idx = int(idx[1:])
-    points = questions[idx]["options"][option]
-    data["score"] += points
-    await state.update_data(score=data["score"], osint=data.get("osint", False))
-    if idx == 1 and option == "OSINT":
-        await ask_osint_question(call.message, state, 0)
-        return
-    if idx + 1 < len(questions):
-        await ask_question(call.message, state, idx + 1)
-    else:
-        await finish_form(call, state)
+    await call.answer()
+    try:
+        data = await state.get_data()
+        score = data.get("score", 0)
+        # формат callback: q{question_index}_{option_index}
+        qpart, opt_idx_str = call.data.split("_", 1)
+        q_idx = int(qpart[1:])  # 'q0' -> 0
+        opt_idx = int(opt_idx_str)
+        option_text = list(questions[q_idx]["options"].keys())[opt_idx]
+        points = questions[q_idx]["options"][option_text]
+        score += points
+        await state.update_data(score=score, osint=data.get("osint", False))
+        logging.info(f"User {call.from_user.id} answered Q{q_idx} -> '{option_text}' (+{points}), total={score}")
+
+        # если на втором вопросе выбран OSINT — задаём OSINT-блок
+        if q_idx == 1 and option_text == "OSINT":
+            await ask_osint_question(call.message, state, 0)
+            return
+
+        # иначе идём дальше по основным вопросам
+        if q_idx + 1 < len(questions):
+            await ask_question(call.message, state, q_idx + 1)
+        else:
+            await finish_form(call, state)
+    except Exception as e:
+        logging.exception("Error in process_answer")
+        # уведомим админа (опционально) и пользователя
+        await bot.send_message(ADMIN_ID, f"Error in process_answer: {e}")
+        await call.message.answer("Произошла ошибка при обработке ответа. Попробуйте ещё раз.")
+        await state.finish()
 
 async def ask_osint_question(message, state, index):
     kb = InlineKeyboardMarkup()
     options = list(osint_questions[index]["options"].keys())
-    for i, option in enumerate(options):
-        kb.add(InlineKeyboardButton(option, callback_data=f"osint_{index}_{i}"))
+    for i, opt_text in enumerate(options):
+        kb.add(InlineKeyboardButton(opt_text, callback_data=f"osint_{index}_{i}"))
     await message.answer(osint_questions[index]["text"], reply_markup=kb)
     await state.set_state(getattr(Form, f"osint_q{index+1}"))
 
 @dp.callback_query_handler(lambda c: c.data.startswith("osint_"), state=[Form.osint_q1, Form.osint_q2, Form.osint_q3, Form.osint_q4])
 async def process_osint_answer(call: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    _, idx, opt_idx = call.data.split("_")
-    idx, opt_idx = int(idx), int(opt_idx)
-    option_text = list(osint_questions[idx]["options"].keys())[opt_idx]
-    points = osint_questions[idx]["options"][option_text]
-    data["score"] += points
-    await state.update_data(score=data["score"], osint=True)
-    if idx + 1 < len(osint_questions):
-        await ask_osint_question(call.message, state, idx + 1)
-    else:
-        await ask_question(call.message, state, 2)
+    await call.answer()
+    try:
+        data = await state.get_data()
+        score = data.get("score", 0)
+        # формат callback: osint_{index}_{option_index}
+        parts = call.data.split("_")
+        # parts = ["osint", "{index}", "{option_index}"]
+        idx = int(parts[1])
+        opt_idx = int(parts[2])
+        option_text = list(osint_questions[idx]["options"].keys())[opt_idx]
+        points = osint_questions[idx]["options"][option_text]
+        score += points
+        await state.update_data(score=score, osint=True)
+        logging.info(f"User {call.from_user.id} OSINT Q{idx} -> '{option_text}' (+{points}), total={score}")
+
+        if idx + 1 < len(osint_questions):
+            await ask_osint_question(call.message, state, idx + 1)
+        else:
+            # вернуться к основным вопросам, к третьему вопросу (index 2)
+            await ask_question(call.message, state, 2)
+    except Exception as e:
+        logging.exception("Error in process_osint_answer")
+        await bot.send_message(ADMIN_ID, f"Error in process_osint_answer: {e}")
+        await call.message.answer("Произошла ошибка при обработке OSINT-ответа. Попробуйте ещё раз.")
+        await state.finish()
 
 async def finish_form(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
     data = await state.get_data()
     score = data.get("score", 0)
     user_id = call.from_user.id
@@ -199,6 +239,7 @@ async def finish_form(call: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query_handler(lambda c: c.data == "send_application")
 async def send_application(call: types.CallbackQuery):
+    await call.answer()
     user_id = call.from_user.id
     username = f"@{call.from_user.username}" if call.from_user.username else "Без username"
     await bot.send_message(
