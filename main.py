@@ -215,31 +215,6 @@ async def finish_form(call: types.CallbackQuery, state: FSMContext):
 
     await state.finish()
 
-@dp.callback_query_handler(lambda c: c.data.startswith("cast_"), state=Form.cast_choice)
-async def process_cast(call: types.CallbackQuery, state: FSMContext):
-    cast = call.data.split("_")[1]
-    data = await state.get_data()
-    selected_casts = data.get("selected_casts", [])
-    if cast not in selected_casts:
-        selected_casts.append(cast)
-    await state.update_data(selected_casts=selected_casts)
-
-@dp.callback_query_handler(lambda c: c.data.startswith("only_"), state=Form.cast_choice)
-async def process_only_cast(call: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    
-    # call.data = "only_yes_OSINT" или "only_no_Эдитор"
-    _, yes_no, cast_name = call.data.split("_", 2)
-
-    if yes_no == "yes":
-        if cast_name == "OSINT":
-            await ask_osint_question(call.message, state, 0)
-        else:
-            await ask_question(call.message, state, 2)  # обычные вопросы для других каст
-    else:
-        # Позволяем выбрать следующую касту
-        await ask_cast_question(call.message, state, data.get("selected_casts", []))
-
 @dp.callback_query_handler(lambda c: c.data == "send_application")
 async def send_application(call: types.CallbackQuery):
     user_id = call.from_user.id
