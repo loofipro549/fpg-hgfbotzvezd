@@ -23,7 +23,6 @@ bot = Bot(token=TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
-
 # === FSM ===
 class Form(StatesGroup):
     q1 = State()
@@ -34,7 +33,6 @@ class Form(StatesGroup):
     osint_q4 = State()
     q3 = State()
     q4 = State()
-
 
 # === ВОПРОСЫ ===
 questions = [
@@ -55,7 +53,7 @@ osint_questions = [
                  "Использование утечек паролей для доступа в аккаунты": -5,
                  "Социальная инженерия и обман для получения данных": 0,
                  "Инструмент для взлома закрытых баз данных": -10}},
-    {"text": "Какой инструмент можно применить для поиска открытых камер, серверов и IoT-устройств?",
+    {"text": "Какной инструмент можно применить для поиска открытых камер, серверов и IoT-устройств?",
      "options": {"Shodan": 10, "Maltego": 7, "Excel": 1, "Photoshop": 0}},
     {"text": "Что стоит проверить в первую очередь при OSINT-анализе профиля человека?",
      "options": {"Фотографии и метаданные (EXIF)": 10,
@@ -64,7 +62,6 @@ osint_questions = [
                  "Игнорировать соцсети и смотреть только гос.реестры": 2}}
 ]
 
-
 # === Работа с ID ===
 def load_ids():
     if not os.path.exists(ID_FILE):
@@ -72,11 +69,9 @@ def load_ids():
     with open(ID_FILE, "r", encoding="utf-8") as f:
         return set(line.strip() for line in f)
 
-
 def save_id(user_id):
     with open(ID_FILE, "a", encoding="utf-8") as f:
         f.write(str(user_id) + "\n")
-
 
 # === Telethon invite по username ===
 async def send_invite(username: str):
@@ -109,7 +104,6 @@ async def send_invite(username: str):
     print(f"[FAIL] Не удалось отправить пользователю {username}")
     return False
 
-
 # === Хэндлеры ===
 @dp.message_handler(commands="start")
 async def start(message: types.Message, state: FSMContext):
@@ -126,18 +120,15 @@ async def start(message: types.Message, state: FSMContext):
     )
     await state.finish()
 
-
 @dp.callback_query_handler(lambda c: c.data == "start_no")
 async def process_no(call: types.CallbackQuery, state: FSMContext):
     await call.message.edit_text("Спасибо, что пришли. Ждём вас ещё.")
     await state.finish()
 
-
 @dp.callback_query_handler(lambda c: c.data == "start_yes")
 async def process_yes(call: types.CallbackQuery, state: FSMContext):
     await state.update_data(score=0, osint=False)
     await ask_question(call.message, state, 0)
-
 
 async def ask_question(message, state, index):
     kb = InlineKeyboardMarkup()
@@ -146,26 +137,24 @@ async def ask_question(message, state, index):
     await message.answer(questions[index]["text"], reply_markup=kb)
     await state.set_state(getattr(Form, f"q{index+1}"))
 
-
 @dp.callback_query_handler(lambda c: c.data.startswith("q"), state=[Form.q1, Form.q2, Form.q3, Form.q4])
 async def process_answer(call: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     idx, option = call.data.split("_", 1)
     idx = int(idx[1:])
     points = questions[idx]["options"][option]
-    data["score"] += points
+    data["score"] = data.get("score", 0) + points
     await state.update_data(score=data["score"], osint=data.get("osint", False))
 
-    if idx == 1:
-        await ask_cast_question(call.message, state)
+    # Исправлено: проверяем, что выбран именно OSINT и это второй вопрос (индекс 1)
+    if idx == 1 and option == "OSINT":
+        await ask_osint_question(call.message, state, 0)
         return
-
 
     if idx + 1 < len(questions):
         await ask_question(call.message, state, idx + 1)
     else:
         await finish_form(call, state)
-
 
 async def ask_osint_question(message, state, index):
     kb = InlineKeyboardMarkup()
@@ -175,7 +164,6 @@ async def ask_osint_question(message, state, index):
     await message.answer(osint_questions[index]["text"], reply_markup=kb)
     await state.set_state(getattr(Form, f"osint_q{index+1}"))
 
-
 @dp.callback_query_handler(lambda c: c.data.startswith("osint_"),
                            state=[Form.osint_q1, Form.osint_q2, Form.osint_q3, Form.osint_q4])
 async def process_osint_answer(call: types.CallbackQuery, state: FSMContext):
@@ -184,7 +172,7 @@ async def process_osint_answer(call: types.CallbackQuery, state: FSMContext):
     idx, opt_idx = int(idx), int(opt_idx)
     option_text = list(osint_questions[idx]["options"].keys())[opt_idx]
     points = osint_questions[idx]["options"][option_text]
-    data["score"] += points
+    data["score"] = data.get("score", 0) + points
     await state.update_data(score=data["score"], osint=True)
 
     if idx + 1 < len(osint_questions):
@@ -233,9 +221,8 @@ async def send_application(call: types.CallbackQuery):
             await call.message.answer("⚠️ Не удалось отправить ссылку. Попробуйте еще раз, или перешлите это сообщение в @BloodyLofiPro_bot.")
     else:
         await call.message.answer(
-            "⚠️ У вас нет username, поэтому ссылка в ЛС не отправлена. Чтобы получить ссылку на вступление в клан, перешлийте это сообщение @BloodyLofiPro_bot."
+            "⚠️ У вас нет username, поэтому ссылка в ЛС не отправлена. Чтобы получить ссылку на вступление в клан, перешлите это сообщение @BloodyLofiPro_bot."
         )
-
 
 # === Запуск ===
 if __name__ == "__main__":
